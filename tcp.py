@@ -53,6 +53,7 @@ class Servidor:
 
             # Atualiza número do byte para o próximo segmento que será enviado
             conexao.seq_no += 1
+            conexao.send_base = conexao.seq_no
 
             if self.callback:
                 self.callback(conexao)
@@ -72,13 +73,9 @@ class Conexao:
         self.id_conexao = id_conexao
         self.callback = None
 
-        # VER PAG 172 DO LIVRO
-        # O número de reconhecimento que o hospedeiro A atribui a seu segmento é o número
-        # de sequência do próximo byte que ele estiver aguardando do hospedeiro B
-
         self.seq_no = None      # número do primeiro byte do segmento que será enviado
         self.ack_no = None      # número de reconhecimento (número de sequência do próximo byte a ser recebido)
-        self.next_seq_no = None
+        self.send_base = None   # número do byte mais antigo ainda não confirmado
         
         self.timer = None
         self.timer_active = False
@@ -88,8 +85,10 @@ class Conexao:
         self.sampleRTT = None
         self.devRTT = None
         self.timeoutInterval = 1
-        #asyncio.get_event_loop().call_later(1, self._exemplo_timer)  # um timer pode ser criado assim; esta linha é só um exemplo e pode ser removida
-        #self.timer.cancel()   # é possível cancelar o timer chamando esse método; esta linha é só um exemplo e pode ser removida
+
+        self.cwnd = MSS  # Janela de congestionamento inicial (1 MSS)
+        
+        asyncio.get_event_loop().call_later(1, self.timeout)
 
 
     # Se existirem pacotes sem confirmação, reenvia os
@@ -99,6 +98,9 @@ class Conexao:
             src_addr = self.not_ack_seqments[0][1]
 
             self.servidor.rede.enviar(segment, src_addr)
+
+            # Reduz a janela de congestionamento pela metade
+            self.cwnd = max(MSS, self.cwnd // 2)
 
             # self.timer = asyncio.get_event_loop().call_later(self.timeoutInterval, self.timeout)
             # self.timer_active = True
@@ -150,7 +152,7 @@ class Conexao:
         # Caso afirmativo, este é apenas uma confirmação da outra ponta
         elif (flags & FLAGS_ACK) == FLAGS_ACK and len(payload) == 0:
             print("Segmento ACK recebido, não é necessário enviar uma resposta.")
-            
+            self.send_base = ack_no
 
             if self.not_ack_seqments:
                 self.computeTimeoutInterval()
@@ -196,8 +198,6 @@ class Conexao:
         """
         Usado pela camada de aplicação para enviar dados
         """
-        # Chame self.servidor.rede.enviar(segmento, dest_addr) para enviar o segmento
-        # que você construir para a camada de rede.
 
         buffer = dados
         (src_addr, src_port, dst_addr, dst_port) = self.id_conexao
@@ -208,12 +208,18 @@ class Conexao:
             payload = buffer[:MSS]
             buffer = buffer[MSS:]
             
+            # Cria o cabeçalho, calcula o checksum e envia o pacote
             header = make_header(dst_port, src_port, self.seq_no, self.ack_no, FLAGS_ACK)
             segment = fix_checksum(header + payload, dst_addr, src_addr)
 
             self.servidor.rede.enviar(segment, src_addr)
+
+            # Atualiza o número de segmento indicando que o próximo pacote a ser enviado
+            # inciará no byte "self.seq_no + payload"
             self.seq_no += len(payload)
 
+            # Guarda o segmento, endereço de destino e tempo em que foi enviado (utilizado para o cáculo do RTT)
+            # para poder reenviar pacotes que excederam o tempo máximo para confirmação
             time_send_seq = time.time()
             self.not_ack_seqments.append([segment, src_addr, time_send_seq])
 
